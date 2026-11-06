@@ -1,0 +1,13 @@
+{
+  "Servers": {
+    "1": {
+      "Name": "EventDesk Postgres",
+      "Group": "Servers",
+      "Port": 5432,
+      "Username": "eventdesk",
+      "Host": "postgres",
+      "SSLMode": "prefer",
+      "MaintenanceDB": "eventdesk_db"
+    }
+  }
+}

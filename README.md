@@ -44,6 +44,7 @@ docker compose up -d
 ```
 Verify running services:
 - PostgreSQL: `localhost:5432`
+- pgAdmin Web UI: `http://localhost:5050` (Login: `admin@example.com` / `admin`)
 - Redis: `localhost:6379`
 - Mailpit Web UI: `http://localhost:8025`
 
