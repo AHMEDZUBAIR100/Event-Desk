@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: eventdesk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-eventdesk}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-eventdesk_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-eventdesk_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-eventdesk} -d ${POSTGRES_DB:-eventdesk_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: eventdesk-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: eventdesk-mailpit
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_SMTP_PORT:-1025}:1025" # SMTP port
+      - "${MAILPIT_WEB_PORT:-8025}:8025"   # Web UI
+    environment:
+      MP_MAX_MESSAGES: 500
+
+volumes:
+  postgres_data:
+  redis_data:
