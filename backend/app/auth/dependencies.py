@@ -70,8 +70,9 @@ async def get_current_user(
 
     if not user.is_active:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Inactive user account.",
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User account is deactivated.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return user
@@ -83,21 +84,49 @@ async def get_current_active_user(
     """Ensures current user is active."""
     if not current_user.is_active:
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
+            status_code=status.HTTP_401_UNAUTHORIZED,
             detail="User account is inactive.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
     return current_user
 
 
-def require_role(*allowed_roles: UserRole) -> Callable[[User], User]:
+def require_role(*allowed_roles: UserRole | str) -> Callable[[User], User]:
     """Dependency factory checking that current user belongs to one of the allowed roles."""
+    normalized_roles = {
+        role.value if isinstance(role, UserRole) else str(role).lower() for role in allowed_roles
+    }
 
     def role_checker(current_user: User = Depends(get_current_user)) -> User:
-        if current_user.role not in allowed_roles:
+        current_role_value = (
+            current_user.role.value
+            if isinstance(current_user.role, UserRole)
+            else str(current_user.role).lower()
+        )
+        if current_role_value not in normalized_roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Access forbidden: required role is one of {[r.value for r in allowed_roles]}.",
+                detail=f"Access forbidden: required role is one of {sorted(normalized_roles)}.",
             )
         return current_user
 
     return role_checker
+
+
+def ownership_check(
+    resource_user_id: uuid.UUID,
+    current_user: User,
+    allow_admin: bool = False,
+) -> None:
+    """Ensures a user can only act on their own resource.
+
+    Raises HTTP 403 if current_user.id does not match resource_user_id
+    (unless allow_admin=True and the user has the admin role).
+    """
+    if allow_admin and current_user.role == UserRole.ADMIN:
+        return
+    if current_user.id != resource_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access forbidden: you do not have permission to access or modify this resource.",
+        )
