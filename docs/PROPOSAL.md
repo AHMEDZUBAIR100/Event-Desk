@@ -1,290 +1,417 @@
-# Implementation Proposal: Day 1 Database Schema & Baseline Migrations
+# Implementation Proposal: Day 1 (Remaining) – Authentication Endpoints
 
-**Review Status**: `APPROVED`
-**Human Approval**: `APPROVED`
-**Implementation Status**: `COMPLETED`
+**Review Status**: `PENDING`
+**Scope**: `POST /auth/register`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`
+**Prerequisite**: Day 2 Users API / RBAC work is implemented and green (`34 passed`, Ruff clean, `alembic check` clean).
 
 ---
 
 ## 1. Overview & Objectives
 
-Design and implement the complete database schema for **EventDesk** covering all core entities required for Day 1 and future extensions. The schema must satisfy the following requirements:
+Complete the authentication surface defined in `docs/API_CONTRACT.md` §1 using the already
+available primitives:
 
-- Provide a robust, ACID‑compliant foundation for users, events, bookings, reviews, notifications, and audit logging.
-- Enforce role‑based access control (RBAC) via reusable FastAPI dependencies.
-- Prevent overselling of tickets through row‑level locking (`SELECT … FOR UPDATE`) inside a single transaction.
-- Support soft‑delete semantics for `users`, `events`, and `bookings`.
-- Align with the official API contract (`docs/API_CONTRACT.md`) and ER diagram (`docs/ERD.md`).
-- Include indexing strategies that enable efficient queries for the most common UI patterns.
+- `app/core/security.py` — `hash_password`, `verify_password`, `create_access_token`, `hash_token`
+- `app/auth/token_service.py` — `create_refresh_token`, `get_valid_refresh_token`, `revoke_user_tokens`
+- `app/auth/dependencies.py` — `get_current_user`, `require_role`, `ownership_check`
+- `User` / `RefreshToken` models with the partial unique active-email index
 
----
+Goals:
 
-## 2. Affected Files & Components
+1. Self-service registration with safe role handling.
+2. Credential login returning an access/refresh token pair plus the user profile.
+3. Refresh-token rotation with replay resistance and concurrent-rotation safety.
+4. Logout that revokes the presented refresh token.
+5. No database schema changes; reuse the existing `users` and `refresh_tokens` tables.
+6. Keep `docs/API_CONTRACT.md` in sync with exact request/response payloads.
 
-### Documentation & Schema
-- `docs/PROPOSAL.md` — This file (single source of truth).
-- `docs/ERD.md` — Updated Mermaid diagram reflecting the final schema.
-
-### Database Models (`backend/app/models/`)
-- `__init__.py` – Package exports for all models.
-- `user.py` – `User`, `UserRole`, `RefreshToken` models.
-- `category.py` – `Category` model.
-- `tag.py` – `Tag` model and `event_tags` association table.
-- `event.py` – `Event`, `EventStatus` models.
-- `booking.py` – `Booking`, `BookingStatus` models.
-- `review.py` – `Review` model.
-- `notification.py` – `Notification`, `NotificationType` models.
-- `audit.py` – `AuditLog` model.
-
-### Core Database Registration
-- `backend/app/db/base.py` – Imports all models for Alembic autodetection.
-
-### Migrations
-- `backend/alembic/versions/001_initial_schema.py` – Initial migration script creating tables, enums, constraints, and indexes.
+Out of scope for this iteration: email verification, password reset, OAuth/social login,
+rate limiting/account lockout, WebSocket auth, and a global `{detail, code, status_code}`
+error envelope. These remain follow-ups (see §9).
 
 ---
 
-## 3. Detailed Database Schema Design
+## 2. Decisions Adopted by This Plan
 
-### 3.1 Enumerations
-- `user_role_enum`: `'admin'`, `'organizer'`, `'attendee'`
-- `event_status_enum`: `'draft'`, `'published'`, `'cancelled'`, `'completed'`
-- `booking_status_enum`: `'pending'`, `'confirmed'`, `'cancelled'`
-- `notification_type_enum`: `'booking_confirmation'`, `'booking_cancellation'`, `'event_reminder'`, `'event_update'`, `'system'`
+These resolve the ambiguities identified during the Day 2 review. They are called out here so
+the reviewer can approve or override them before implementation starts.
 
-### 3.2 Entities & Attributes
+| # | Decision | Default adopted |
+| :--- | :--- | :--- |
+| D1 | Refresh/logout token transport | JSON body field `refresh_token`, not a cookie or `Authorization` header |
+| D2 | Self-registration roles | `attendee` (default) and `organizer`; `admin` is rejected with `403` |
+| D3 | Register response | `201 Created` returning `UserRead` only; no automatic token issuance |
+| D4 | `GET /auth/me` | Deferred; `/api/v1/users/me` remains the canonical profile endpoint |
+| D5 | Error shape | Existing FastAPI `{"detail": "..."}` shape for consistency with current routes; global envelope is a follow-up |
+| D6 | Email handling | Normalize to lowercase on write; case-insensitive lookup on login |
+| D7 | Access-token claims | `sub`, `role`, `type="access"`, `exp` (refresh tokens remain opaque random strings) |
 
-#### `users`
-- `id` UUID PK (default `uuid4`)
-- `email` VARCHAR(255) NOT NULL – partial unique index `uq_users_active_email` where `deleted_at IS NULL`
-- `hashed_password` VARCHAR(255) NOT NULL
-- `full_name` VARCHAR(255) NOT NULL
-- `role` `user_role_enum` NOT NULL DEFAULT `'attendee'`
-- `is_active` BOOLEAN NOT NULL DEFAULT TRUE
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-- `deleted_at` TIMESTAMPTZ NULL (soft delete)
-
-#### `refresh_tokens`
-- `id` UUID PK
-- `user_id` UUID FK → `users.id` ON DELETE CASCADE NOT NULL
-- `token_hash` VARCHAR(64) NOT NULL UNIQUE
-- `expires_at` TIMESTAMPTZ NOT NULL
-- `revoked` BOOLEAN NOT NULL DEFAULT FALSE
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-
-#### `categories`
-- `id` UUID PK
-- `name` VARCHAR(100) NOT NULL
-- `slug` VARCHAR(120) NOT NULL UNIQUE
-- `description` TEXT NULL
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-
-#### `tags`
-- `id` UUID PK
-- `name` VARCHAR(50) NOT NULL
-- `slug` VARCHAR(60) NOT NULL UNIQUE
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-
-#### `event_tags` (association)
-- `event_id` UUID FK → `events.id` ON DELETE CASCADE PK
-- `tag_id` UUID FK → `tags.id` ON DELETE CASCADE PK
-
-#### `events`
-- `id` UUID PK
-- `organizer_id` UUID FK → `users.id` ON DELETE RESTRICT NOT NULL
-- `category_id` UUID FK → `categories.id` ON DELETE SET NULL NULLABLE
-- `title` VARCHAR(255) NOT NULL
-- `description` TEXT NOT NULL
-- `venue` VARCHAR(255) NOT NULL
-- `starts_at` TIMESTAMPTZ NOT NULL
-- `price` NUMERIC(10,2) NOT NULL DEFAULT `0.00`
-- `total_tickets` INTEGER NOT NULL
-- `tickets_available` INTEGER NOT NULL
-- `status` `event_status_enum` NOT NULL DEFAULT `'draft'`
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-- `deleted_at` TIMESTAMPTZ NULL
-- **Check constraints**:
-  - `ck_events_tickets_available`: `tickets_available >= 0 AND tickets_available <= total_tickets`
-  - `ck_events_total_tickets_positive`: `total_tickets >= 0`
-  - `ck_events_price_non_negative`: `price >= 0`
-
-#### `bookings`
-- `id` UUID PK
-- `user_id` UUID FK → `users.id` ON DELETE RESTRICT NOT NULL
-- `event_id` UUID FK → `events.id` ON DELETE RESTRICT NOT NULL
-- `quantity` INTEGER NOT NULL
-- `total_price` NUMERIC(10,2) NOT NULL
-- `status` `booking_status_enum` NOT NULL DEFAULT `'pending'`
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-- `deleted_at` TIMESTAMPTZ NULL
-- **Check constraints**:
-  - `ck_bookings_quantity_positive`: `quantity > 0`
-  - `ck_bookings_total_price_non_negative`: `total_price >= 0`
-
-#### `reviews`
-- `id` UUID PK
-- `user_id` UUID FK → `users.id` ON DELETE RESTRICT NOT NULL
-- `event_id` UUID FK → `events.id` ON DELETE CASCADE NOT NULL
-- `parent_id` UUID FK → `reviews.id` ON DELETE CASCADE NULLABLE
-- `rating` INTEGER NOT NULL
-- `comment` TEXT NOT NULL
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-- `updated_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()` ON UPDATE `utcnow()`
-- **Check constraint**: `ck_reviews_rating_range`: `rating >= 1 AND rating <= 5`
-
-#### `notifications`
-- `id` UUID PK
-- `user_id` UUID FK → `users.id` ON DELETE CASCADE NOT NULL
-- `type` `notification_type_enum` NOT NULL
-- `title` VARCHAR(255) NOT NULL
-- `body` TEXT NOT NULL
-- `is_read` BOOLEAN NOT NULL DEFAULT FALSE
-- `data` JSONB NOT NULL DEFAULT `'{}'`
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
-
-#### `audit_logs`
-- `id` UUID PK
-- `actor_id` UUID FK → `users.id` ON DELETE SET NULL NULLABLE
-- `action` VARCHAR(100) NOT NULL
-- `entity_type` VARCHAR(100) NOT NULL
-- `entity_id` UUID NOT NULL
-- `metadata` JSONB NOT NULL DEFAULT `'{}'`
-- `created_at` TIMESTAMPTZ NOT NULL DEFAULT `utcnow()`
+If any decision is rejected, the affected schemas, tests, and contract rows must be updated
+before coding proceeds.
 
 ---
 
-## 4. Mermaid ER Diagram
+## 3. Affected Files & Components
 
-```mermaid
-erDiagram
-    User ||--o{ RefreshToken : "owns"
-    User ||--o{ Event : "organizes"
-    User ||--o{ Booking : "books"
-    User ||--o{ Review : "writes"
-    User ||--o{ Notification : "receives"
-    User ||--o{ AuditLog : "triggers (actor)"
+### New files
 
-    Category ||--o{ Event : "classifies"
+| Path | Purpose |
+| :--- | :--- |
+| `backend/app/schemas/auth.py` | Request/response Pydantic v2 schemas for auth. |
+| `backend/app/auth/service.py` | Registration, authentication, token issuance/rotation, logout logic. |
+| `backend/app/auth/router.py` | Thin `/auth/*` endpoints and HTTP status mapping. |
+| `backend/tests/test_auth/test_endpoints.py` | End-to-end endpoint tests (register → login → refresh → logout). |
+| `backend/tests/test_auth/test_auth_service.py` | Service-level tests for rotation, revocation, duplicate email, inactive users. |
 
-    Event ||--o{ EventTag : "tagged"
-    Tag ||--o{ EventTag : "tagged"
+### Modified files
 
-    Event ||--o{ Booking : "contains"
-    Event ||--o{ Review : "receives"
+| Path | Change |
+| :--- | :--- |
+| `backend/app/auth/token_service.py` | Add locked refresh lookup, single-token revocation, and rotation helper. |
+| `backend/app/schemas/__init__.py` | Export the new auth schemas. |
+| `backend/app/main.py` | `app.include_router(auth_router, prefix=settings.API_V1_STR)`. |
+| `docs/API_CONTRACT.md` | Document exact request/response bodies, status codes, and role rules. |
 
-    Review ||--o{ Review : "parent/replies"
-```
+### Not touched
 
----
-
-## 5. Indexing Strategy for Common Queries
-
-1. **`users`**
-   - `uq_users_active_email` (UNIQUE) `ON users (email) WHERE deleted_at IS NULL`
-   - `ix_users_role_active` `ON users (role, is_active) WHERE deleted_at IS NULL`
-
-2. **`refresh_tokens`**
-   - `uq_refresh_tokens_token_hash` (UNIQUE) `ON refresh_tokens (token_hash)`
-   - `ix_refresh_tokens_user_revoked` `ON refresh_tokens (user_id, revoked, expires_at)`
-
-3. **`events`**
-   - `ix_events_active_catalog` `ON events (status, starts_at) WHERE deleted_at IS NULL`
-   - `ix_events_organizer_id` `ON events (organizer_id) WHERE deleted_at IS NULL`
-   - `ix_events_category_id` `ON events (category_id) WHERE deleted_at IS NULL`
-
-4. **`bookings`**
-   - `ix_bookings_user_active` `ON bookings (user_id, created_at DESC) WHERE deleted_at IS NULL`
-   - `ix_bookings_event_status` `ON bookings (event_id, status) WHERE deleted_at IS NULL`
-
-5. **`reviews`**
-   - `ix_reviews_event_parent` `ON reviews (event_id, parent_id, created_at DESC)`
-
-6. **`notifications`**
-   - `ix_notifications_user_unread` `ON notifications (user_id, is_read, created_at DESC)`
-
-7. **`audit_logs`**
-   - `ix_audit_logs_entity` `ON audit_logs (entity_type, entity_id)`
-   - `ix_audit_logs_actor_created` `ON audit_logs (actor_id, created_at DESC)`
+- `backend/app/models/**`, `backend/alembic/**` — no schema changes.
+- `backend/app/users/**` — existing user/RBAC endpoints stay unchanged.
+- `frontend/**` — no frontend exists yet.
 
 ---
 
-## 6. Security & Integrity Considerations
+## 4. API Design
 
-- **Password & Token Storage** – Passwords hashed with Argon2; refresh tokens stored as SHA‑256 hashes.
-- **Concurrency Overselling Prevention** – Booking service MUST acquire a `SELECT ... FOR UPDATE` lock on the target `events` row, adjust `tickets_available` atomically, and ONLY THEN commit. The database CHECK `tickets_available >= 0` acts as a safety net.
-- **Soft‑Delete Data Isolation** – All default queries in the codebase must filter on `deleted_at IS NULL`. Partial unique indexes (e.g., on `email`) enforce uniqueness only among active rows.
-- **Audit Logging** – Critical actions (event creation/update, booking, cancellation) must insert an `audit_logs` record **after** the DB transaction commits successfully.
+All endpoints live under `/api/v1/auth` and accept/return JSON.
 
----
+### 4.1 `POST /auth/register` — public
 
-## 7. Performance Considerations
+Request:
 
-- Pagination defaults (`page=1`, `size=20`) for list endpoints to avoid large result sets.
-- Use the indexed columns defined above for ordering and filtering.
-- Apply `SELECT ... LIMIT … OFFSET …` with appropriate indexes; consider cursor‑based pagination for deep scrolling.
-- Cache frequently accessed static data (e.g., `categories`, `tags`) in Redis with short TTLs.
-
----
-
-## 8. Error Handling
-
-All error responses must follow the format defined in `docs/API_CONTRACT.md`:
 ```json
-{ "detail": "Error description", "code": "SPECIFIC_ERROR_CODE", "status_code": 400 }
+{
+  "email": "user@example.com",
+  "password": "StrongPass123!",
+  "full_name": "Jane Doe",
+  "role": "attendee"
+}
 ```
-Service‑layer exceptions should be translated to this schema via FastAPI exception handlers.
+
+Rules:
+
+- `email`: `EmailStr`, normalized to lowercase before insert and lookup.
+- `password`: 8–128 characters.
+- `full_name`: 1–255 characters.
+- `role`: `attendee` or `organizer`; `admin` → `403`.
+- Duplicate active email → `409 Conflict`.
+- A soft-deleted account's email may be reused (existing partial unique index).
+
+Responses:
+
+| Status | Body |
+| :--- | :--- |
+| `201` | `UserRead` (no tokens) |
+| `403` | `{"detail": "Admin accounts cannot be self-registered."}` |
+| `409` | `{"detail": "An account with this email already exists."}` |
+| `422` | Pydantic validation errors |
+
+### 4.2 `POST /auth/login` — public
+
+Request:
+
+```json
+{
+  "email": "user@example.com",
+  "password": "StrongPass123!"
+}
+```
+
+Behavior:
+
+- Case-insensitive email lookup, excluding `deleted_at IS NOT NULL`.
+- Verify Argon2 hash.
+- Reject `is_active = false` and soft-deleted users.
+- Return one generic `401` for every failure reason (no user enumeration).
+
+Response `200`:
+
+```json
+{
+  "access_token": "<jwt>",
+  "refresh_token": "<opaque-random-token>",
+  "token_type": "bearer",
+  "expires_in": 900,
+  "user": { "...UserRead..." }
+}
+```
+
+### 4.3 `POST /auth/refresh` — public (valid refresh token required)
+
+Request:
+
+```json
+{ "refresh_token": "<opaque-random-token>" }
+```
+
+Behavior (single transaction):
+
+1. Hash the incoming token and select its row with `SELECT ... FOR UPDATE`.
+2. Reject if missing, already revoked, or expired.
+3. Load the owning user; reject if soft-deleted or inactive.
+4. Mark the old token `revoked = true`.
+5. Create a new refresh token for the same user.
+6. Commit, then mint a new access token (no external side effects before commit).
+
+Response `200`: same shape as login (`access_token`, `refresh_token`, `token_type`,
+`expires_in`, `user`). Any invalid/expired/revoked/reused token → `401`.
+
+### 4.4 `POST /auth/logout` — authenticated
+
+Headers: `Authorization: Bearer <access_token>`
+
+Request:
+
+```json
+{ "refresh_token": "<opaque-random-token>" }
+```
+
+Behavior:
+
+- Look up the refresh token by hash.
+- Only revoke it if it belongs to the authenticated user.
+- Always return `204 No Content`, even if the token is missing, already revoked, or owned by
+  another user (prevents enumeration and makes logout idempotent).
+
+### 4.5 Deferred
+
+`GET /auth/me` is listed in the contract but is not part of this iteration (D4). The contract
+row will note that `/users/me` is the canonical alternative, and the alias can be added later
+without schema changes.
 
 ---
 
-## 9. Implementation Steps (Execute after human approval)
+## 5. Schema Definitions (`backend/app/schemas/auth.py`)
 
-1. **Update `docs/ERD.md`** – Insert the finalized Mermaid diagram and relationship rules.
-2. **Create SQLAlchemy models** using `TimestampMixin` and `SoftDeleteMixin` for automatic timestamps and soft‑delete handling:
-   - `backend/app/models/user.py`
-   - `backend/app/models/category.py`
-   - `backend/app/models/tag.py`
-   - `backend/app/models/event.py`
-   - `backend/app/models/booking.py`
-   - `backend/app/models/review.py`
-   - `backend/app/models/notification.py`
-   - `backend/app/models/audit.py`
-   - `backend/app/models/__init__.py`
-3. **Add reusable RBAC dependencies** in `backend/app/auth/dependencies.py` (`require_role`, `get_current_user`) and ensure all routers import them.
-4. **Configure global soft‑delete filters** – Use SQLAlchemy events or a custom Base query class so that `deleted_at IS NULL` is applied automatically.
-5. **Re‑export all models** in `backend/app/db/base.py` for Alembic autodetection.
-6. **Generate initial Alembic migration** (`001_initial_schema.py`) and run `alembic upgrade head`.
-7. **Verify migration** – Perform downgrade‑upgrade cycle (`alembic downgrade base && alembic upgrade head`).
+```text
+RegisterRequest
+  email: EmailStr
+  password: str (min_length=8, max_length=128)
+  full_name: str (min_length=1, max_length=255)
+  role: UserRole = UserRole.ATTENDEE
 
----
+LoginRequest
+  email: EmailStr
+  password: str (min_length=1)
 
-## 10. Testing Strategy
+RefreshRequest
+  refresh_token: str (min_length=1)
 
-1. **Migration Integrity** – Tests that apply the migration on a fresh PostgreSQL instance and roll it back.
-2. **Constraint Verification** – Unit tests asserting that the CHECK constraints reject invalid data (negative tickets, over‑capacity tickets, out‑of‑range ratings, duplicate active emails).
-3. **Service‑Layer Unit Tests** – Validate that the booking service:
-   - Acquires a row‑level lock.
-   - Updates `tickets_available` correctly.
-   - Creates an `audit_logs` entry **after** commit.
-   - Returns appropriate error responses adhering to the API contract.
-4. **Concurrency Stress Test** – Simulate 50 concurrent booking requests for the same event and assert that total tickets sold never exceed `total_tickets`.
-5. **RBAC Tests** – Ensure endpoints reject unauthorized roles according to the `require_role` dependencies.
-6. **Performance Tests** – Verify pagination limits and index usage via query‑plan inspection.
+LogoutRequest
+  refresh_token: str (min_length=1)
+
+TokenPair
+  access_token: str
+  refresh_token: str
+  token_type: str = "bearer"
+  expires_in: int   # seconds, ACCESS_TOKEN_EXPIRE_MINUTES * 60
+
+AuthResponse(TokenPair)
+  user: UserRead    # imported from app.schemas.users
+```
+
+`UserRead` remains the single public user representation. No password/hash/token fields are
+ever serialized.
 
 ---
 
-## 11. Reviewer Change Log
+## 6. Service & Token-Service Changes
 
-- Added **Review Status**, **Human Approval**, and **Implementation Status** headers.
-- Inserted explicit RBAC dependency requirement in Implementation Steps.
-- Clarified soft‑delete handling and added a global filter reminder.
-- Expanded **Security & Integrity** to explicitly mandate `SELECT … FOR UPDATE` and post‑commit audit logging.
-- Added a new **Performance Considerations** section.
-- Added an **Error Handling** section referencing the standard error format.
-- Updated **Testing Strategy** with service‑layer unit tests and a concurrency stress test.
-- Removed the previous “Review Summary” block that duplicated information.
-- Consolidated the proposal into a single, consistent document that serves as the sole source of truth.
+### 6.1 `backend/app/auth/token_service.py` additions
+
+| Function | Behavior |
+| :--- | :--- |
+| `get_refresh_token(db, raw_token, *, include_revoked=False, for_update=False)` | Hash + select one token; optional `with_for_update()` for rotation. |
+| `revoke_refresh_token(db, raw_token) -> bool` | Set `revoked=True` on one matching token; returns whether a row changed. |
+| `rotate_refresh_token(db, raw_token) -> tuple[str, RefreshToken, User]` | Locked lookup → validate → revoke old → create new (flush only; caller commits). |
+
+Existing `create_refresh_token`, `get_valid_refresh_token`, and `revoke_user_tokens` remain
+unchanged. New helpers raise typed domain errors or return `None`; HTTP mapping stays in the
+service/router.
+
+### 6.2 `backend/app/auth/service.py`
+
+```text
+register_user(db, payload) -> User
+  - reject role == ADMIN
+  - normalize email
+  - pre-check active email; catch IntegrityError for the race and map to 409
+  - hash_password, insert, commit, refresh
+
+authenticate_user(db, email, password) -> User
+  - case-insensitive active lookup
+  - verify_password; generic 401 on mismatch/missing/inactive/deleted
+  - optional dummy-hash verification on missing user to reduce timing leakage
+
+issue_token_pair(db, user) -> TokenPair
+  - create_refresh_token(...)
+  - create_access_token(user.id, extra_claims={"role": user.role.value, "type": "access"})
+  - expires_in from settings
+
+login(db, payload) -> AuthResponse
+  - authenticate_user + issue_token_pair + commit
+
+rotate_tokens(db, raw_token) -> AuthResponse
+  - token_service.rotate_refresh_token + issue new access token + commit
+
+logout(db, user, raw_token) -> None
+  - revoke only if owned by `user`; commit
+```
+
+Transaction rule: refresh-token rotation and revocation happen inside one database
+transaction. No Celery/Redis/WebSocket/email side effects exist in these flows.
+
+### 6.3 Router (`backend/app/auth/router.py`)
+
+```text
+router = APIRouter(prefix="/auth", tags=["Authentication"])
+
+POST /register  -> 201 UserRead
+POST /login     -> 200 AuthResponse
+POST /refresh   -> 200 AuthResponse
+POST /logout    -> 204, Depends(get_current_user)
+```
+
+The router only validates HTTP input and translates service exceptions into status codes. All
+business logic stays in `service.py`.
+
+### 6.4 `backend/app/main.py`
+
+```python
+from app.auth.router import router as auth_router
+...
+app.include_router(auth_router, prefix=settings.API_V1_STR)
+```
+
+No duplicate/unprefixed mounting (same rule applied to the users router).
+
+---
+
+## 7. Tests
+
+### 7.1 Registration (`test_endpoints.py`)
+
+- 201 for attendee and organizer; password is hashed (never equal to input).
+- `role=admin` → 403 and no row inserted.
+- Duplicate active email → 409; soft-deleted email can be reused.
+- Weak/short password, invalid email, blank full name → 422.
+- Response never contains `hashed_password`.
+
+### 7.2 Login
+
+- Correct credentials → 200 with both tokens, `token_type`, `expires_in`, and user profile.
+- Wrong password, unknown email, inactive user, soft-deleted user → generic 401.
+- Returned access token authorizes `GET /api/v1/users/me`.
+- Email lookup is case-insensitive.
+
+### 7.3 Refresh
+
+- Valid token → 200 and a **different** refresh token.
+- Old token is rejected on a second use → 401.
+- Expired token → 401; malformed token → 401.
+- User deactivated/soft-deleted after issuance → 401.
+- Concurrent refresh with the same token: exactly one succeeds (row lock); the other is 401.
+- Raw tokens are never stored; only SHA-256 hashes exist in `refresh_tokens`.
+
+### 7.4 Logout
+
+- `204` and the token is revoked.
+- Repeating logout is still `204` (idempotent).
+- A token belonging to another user is not revoked.
+- Missing/invalid access token → 401.
+- After logout, refreshing with the revoked token → 401.
+
+### 7.5 Full flow
+
+- register → login → authenticated request → refresh → logout → refresh fails.
+- Existing `tests/test_users`, `tests/test_auth`, and `tests/test_schema` stay green.
+
+### 7.6 Fixtures
+
+Reuse `db_session`, `client`, `admin_user`, `organizer_user`, `attendee_user`, and
+`deactivated_user` from `backend/tests/conftest.py`. Auth tests may build small local helpers
+for login/refresh payloads but must not reach into another test's rows.
+
+---
+
+## 8. Verification Commands
+
+```bash
+cd backend
+./.venv/bin/ruff check app tests
+./.venv/bin/ruff format --check app tests
+./.venv/bin/python -m pytest tests/test_auth -q
+./.venv/bin/python -m pytest -q
+./.venv/bin/alembic check
+```
+
+Manual smoke checks (after implementation):
+
+```bash
+# register
+curl -X POST http://localhost:8000/api/v1/auth/register \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"smoke@example.com","password":"StrongPass123!","full_name":"Smoke User","role":"attendee"}'
+
+# login
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"smoke@example.com","password":"StrongPass123!"}'
+
+# refresh / logout / me
+curl -X POST http://localhost:8000/api/v1/auth/refresh \
+  -H 'Content-Type: application/json' -d '{"refresh_token":"<token>"}'
+curl -X POST http://localhost:8000/api/v1/auth/logout \
+  -H "Authorization: Bearer <access>" -H 'Content-Type: application/json' \
+  -d '{"refresh_token":"<token>"}'
+curl http://localhost:8000/api/v1/users/me -H "Authorization: Bearer <access>"
+```
+
+Acceptance criteria:
+
+- All commands above pass; full suite remains green.
+- No raw refresh token is persisted.
+- A revoked/expired/inactive/deleted case always yields 401.
+- OpenAPI shows only `/api/v1/auth/*` (no unprefixed aliases).
+
+---
+
+## 9. Known Limitations / Follow-ups
+
+1. **Error envelope**: the contract's `{detail, code, status_code}` shape is not implemented
+   globally; auth uses the existing `{"detail"}` shape. A dedicated follow-up should add a
+   shared exception handler and update all endpoints together.
+2. **`GET /auth/me`**: deferred; `/users/me` remains canonical (D4).
+3. **Rate limiting / lockout**: no brute-force protection yet.
+4. **Refresh-token reuse detection**: revoked tokens return 401 but do not revoke the user's
+   other sessions. A token-family model can be added later.
+5. **Email verification**: accounts are usable immediately after registration.
+6. **Frontend integration**: `frontend/` is still a scaffold; generated types cannot be
+   consumed until the Next.js app exists.
+7. **Password change sessions**: `PATCH /users/me` does not revoke existing refresh tokens;
+   unchanged by this plan.
+
+---
+
+## 10. Estimated Time
+
+| Work | Estimate |
+| :--- | :--- |
+| Schemas + token-service helpers | 45 min |
+| Service layer | 75 min |
+| Router + `main.py` wiring | 30 min |
+| API contract update | 20 min |
+| Tests (endpoint + service) | 90 min |
+| Full verification / fixes | 30 min |
+| **Total** | **~4.5 hours** |
+
+Adjust if any of the §2 decisions are overridden.
