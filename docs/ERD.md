@@ -144,7 +144,8 @@ erDiagram
    - `Booking.quantity`: `CHECK (quantity > 0)`.
    - `Booking.total_price`: `CHECK (total_price >= 0)`.
 4. **Audit Trail**:
-   - Critical domain events (create/update event, create/cancel booking, role alteration) insert records into `audit_logs` **after** successful transaction commit.
+   - Critical domain events (create/update/cancel/delete event, create/cancel booking, role alteration) insert records into `audit_logs` **in the same database transaction** as the audited change. The domain change and its audit row commit or roll back atomically.
+   - External side effects (notifications, email, Celery jobs, WebSocket broadcasts) must run only **after** the transaction commits successfully (ADR 003).
 5. **Common Indexes**:
    - `uq_users_active_email` on `users(email) WHERE deleted_at IS NULL`
    - `ix_users_role_active` on `users(role, is_active) WHERE deleted_at IS NULL`
