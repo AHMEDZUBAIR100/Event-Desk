@@ -8,7 +8,7 @@
 | **TASK-002** | Day 1: User & Auth schema with Alembic migration | Database Agent | `DONE` | TASK-001 |
 | **TASK-003** | Day 1: Auth endpoints (register, login, refresh, logout, me) | Backend Agent | `TODO` | TASK-002 |
 | **TASK-004** | Day 1: Frontend base scaffold & auth pages | Frontend Agent | `TODO` | TASK-003 |
-| **TASK-005** | Day 2: Events schema & endpoints (CRUD, listing, filter) | Database + Backend | `TODO` | TASK-003 |
+| **TASK-005** | Day 2: Events schema & endpoints (CRUD, listing, filter) | Database + Backend | `DONE` | TASK-003 |
 | **TASK-006** | Day 2: Frontend event catalogue & detail view | Frontend Agent | `TODO` | TASK-005 |
 | **TASK-007** | Day 3: Booking & Cancellation service with row locking | Backend + Database | `TODO` | TASK-005 |
 | **TASK-008** | Day 3: Concurrency proof test (50 concurrent requests) | Backend Agent | `TODO` | TASK-007 |
