@@ -12,6 +12,7 @@ from app.core.config import settings
 from app.core.security import create_access_token, hash_password
 from app.db.session import get_db
 from app.main import app
+from app.models.event import Event
 from app.models.user import User, UserRole
 
 
@@ -83,6 +84,13 @@ async def _create_test_user_record(
     return user
 
 
+async def _delete_user_and_owned_events(db: AsyncSession, user_id: object) -> None:
+    """Delete a test user's events first (FK is RESTRICT), then the user."""
+    await db.execute(delete(Event).where(Event.organizer_id == user_id))
+    await db.execute(delete(User).where(User.id == user_id))
+    await db.commit()
+
+
 @pytest.fixture
 async def admin_user(db_session: AsyncSession) -> AsyncGenerator[User, None]:
     """Yields a persisted Admin user with active authentication tokens."""
@@ -91,8 +99,7 @@ async def admin_user(db_session: AsyncSession) -> AsyncGenerator[User, None]:
     try:
         yield user
     finally:
-        await db_session.execute(delete(User).where(User.id == user_id))
-        await db_session.commit()
+        await _delete_user_and_owned_events(db_session, user_id)
 
 
 @pytest.fixture
@@ -103,8 +110,7 @@ async def organizer_user(db_session: AsyncSession) -> AsyncGenerator[User, None]
     try:
         yield user
     finally:
-        await db_session.execute(delete(User).where(User.id == user_id))
-        await db_session.commit()
+        await _delete_user_and_owned_events(db_session, user_id)
 
 
 @pytest.fixture
