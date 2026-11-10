@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth.router import router as auth_router
 from app.core.config import settings
 from app.db.session import engine, get_db
+from app.events.router import router as events_router
 from app.schemas.health import HealthResponse, ReadinessResponse
 from app.users.router import router as users_router
 
@@ -48,6 +49,7 @@ app.add_middleware(
 # Include API v1 routers
 app.include_router(auth_router, prefix=settings.API_V1_STR)
 app.include_router(users_router, prefix=settings.API_V1_STR)
+app.include_router(events_router, prefix=settings.API_V1_STR)
 
 
 @app.get(
