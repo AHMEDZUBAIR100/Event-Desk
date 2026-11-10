@@ -99,11 +99,158 @@ Request:
 
 | Method | Endpoint | Auth Required | Description |
 | :--- | :--- | :--- | :--- |
-| `GET` | `/events` | None | List published events with pagination (`page`, `size`, `search`, `status`). |
-| `GET` | `/events/{id}` | None | Get detailed event information including available tickets and reviews summary. |
-| `POST` | `/events` | Organizer / Admin | Create a new event. |
-| `PATCH` | `/events/{id}` | Organizer (Owner) / Admin | Update event details. (Checks organizer ownership). |
-| `DELETE`| `/events/{id}` | Organizer (Owner) / Admin | Soft-delete an event. |
+| `GET` | `/events` | None | Public catalogue of published, non-deleted events with filters, sorting, and pagination. |
+| `GET` | `/events/{id}` | None | Get a published, non-deleted event with category, tags, organizer summary, and live availability. |
+| `POST` | `/events` | Organizer / Admin | Create an event. `tickets_available` is initialized to `total_tickets`. |
+| `PATCH` | `/events/{id}` | Organizer (Owner) / Admin | Partial update and status transitions. Organizers may only modify their own events. |
+| `DELETE` | `/events/{id}` | Organizer (Owner) / Admin | Soft-delete an event (`deleted_at` is set; the row is retained). |
+
+### 3.1 `GET /events` — query parameters
+
+| Parameter | Type | Rules |
+| :--- | :--- | :--- |
+| `page` | int | ≥ 1, default `1`. |
+| `size` | int | 1–100, default `20`. |
+| `search` | str | Case-insensitive `ILIKE` match on `title`. |
+| `category` | str | Category slug. Unknown slug returns an empty page. |
+| `tag` | str | Tag slug; repeatable. Multiple tags use **OR** semantics. |
+| `date_from` | datetime | `starts_at >= date_from` (ISO 8601). |
+| `date_to` | datetime | `starts_at <= date_to` (ISO 8601). |
+| `price_min` | decimal | ≥ 0. |
+| `price_max` | decimal | ≥ 0. |
+| `sort` | enum | `date` (default) or `price`. |
+| `order` | enum | `asc` (default) or `desc`. |
+
+Behavior:
+
+- Only `status = published` and `deleted_at IS NULL` events are returned.
+- `date_from > date_to` or `price_min > price_max` → `422`.
+- Unknown category/tag slugs return an empty page, not `404`.
+- Tie-break on `id` for deterministic pagination.
+
+Response `200`:
+
+```json
+{
+  "items": [ { "...EventRead..." } ],
+  "total": 123,
+  "page": 1,
+  "size": 20
+}
+```
+
+### 3.2 `GET /events/{id}`
+
+- Returns `200` `EventDetailRead` (same shape as `EventRead` until the Day 4 reviews summary).
+- Returns `404` when the event is missing, soft-deleted, or not `published`.
+
+### 3.3 `POST /events`
+
+Request:
+
+```json
+{
+  "category_id": "9f1c2b3e-0000-4000-8000-000000000000",
+  "title": "PyCon 2026",
+  "description": "Annual Python conference",
+  "venue": "Convention Center",
+  "starts_at": "2026-12-01T18:00:00Z",
+  "price": "199.00",
+  "total_tickets": 500,
+  "status": "draft",
+  "tag_ids": ["9f1c2b3e-0000-4000-8000-000000000001"]
+}
+```
+
+- `title`: 1–255 chars; `description`: ≥ 1 char; `venue`: 1–255 chars.
+- `price`: decimal ≥ 0 (`NUMERIC(10,2)`); `total_tickets`: integer ≥ 0.
+- `status`: `draft` (default) or `published` on creation; other values → `422`.
+- `category_id`, when provided, must reference an existing category; every `tag_ids` entry must reference an existing tag; otherwise `422`.
+- `organizer_id` is taken from the authenticated user.
+- Responses: `201` `EventRead`, `401` unauthenticated, `403` attendee, `422` validation error.
+
+### 3.4 `PATCH /events/{id}`
+
+Request (`EventUpdate`; all fields optional):
+
+```json
+{
+  "category_id": null,
+  "title": "PyCon 2026 (Updated)",
+  "price": "149.00",
+  "total_tickets": 600,
+  "status": "published",
+  "tag_ids": []
+}
+```
+
+- Omitted fields remain unchanged.
+- `category_id: null` clears the category; `tag_ids: []` clears all tags.
+- Explicit `null` for `title`, `description`, `venue`, `starts_at`, `price`, `total_tickets`, `status`, or `tag_ids` → `422`.
+- Field edits are allowed only while the event is `draft` or `published`; editing `cancelled`/`completed` → `409`.
+- `total_tickets` may not drop below the number already sold (`total_tickets - tickets_available`); violation → `409`. Availability is recalculated as `new_total - sold`.
+- `tag_ids` replaces the complete tag set.
+- The event row is locked with `SELECT ... FOR UPDATE` before validation.
+- Responses: `200` `EventRead`, `401`, `403` (attendee or non-owner organizer), `404`, `409` (invalid transition/terminal edit/ticket count), `422`.
+
+### 3.5 Status machine
+
+| Current | Allowed targets |
+| :--- | :--- |
+| `draft` | `published`, `cancelled` |
+| `published` | `cancelled`, `completed` |
+| `cancelled` | none (terminal) |
+| `completed` | none (terminal) |
+
+Invalid transitions return `409`. A PATCH containing only the event's current status is an idempotent no-op: it returns `200` without changing `updated_at`, writing an audit row, or committing. This also applies to `cancelled` and `completed` events; any actual field edit or real transition on a terminal event still returns `409`.
+
+### 3.6 `DELETE /events/{id}`
+
+- Sets `deleted_at`; the row is never hard-deleted and disappears from the catalogue and detail endpoints.
+- Responses: `204`; `401` unauthenticated; `403` non-owner organizer/attendee; `404` missing or already deleted.
+
+### 3.7 Event response shape (`EventRead`)
+
+```json
+{
+  "id": "uuid",
+  "organizer_id": "uuid",
+  "organizer": { "id": "uuid", "full_name": "Jane Doe" },
+  "category_id": "uuid | null",
+  "category": { "id": "uuid", "name": "Conferences", "slug": "conferences" },
+  "title": "PyCon 2026",
+  "description": "Annual Python conference",
+  "venue": "Convention Center",
+  "starts_at": "2026-12-01T18:00:00Z",
+  "price": "199.00",
+  "total_tickets": 500,
+  "tickets_available": 500,
+  "status": "draft",
+  "tags": [{ "id": "uuid", "name": "python", "slug": "python" }],
+  "created_at": "2026-11-10T12:00:00Z",
+  "updated_at": "2026-11-10T12:00:00Z"
+}
+```
+
+`price` is a decimal serialized as a JSON string. `deleted_at` is never exposed.
+
+### 3.8 Categories & tags
+
+| Method | Endpoint | Auth Required | Description |
+| :--- | :--- | :--- | :--- |
+| `GET` | `/categories` | None | List categories ordered by name. |
+| `POST` | `/categories` | Admin | Create a category. Body: `name` (1–100), optional `slug` (1–120), optional `description`. |
+| `GET` | `/tags` | None | List tags ordered by name. |
+| `POST` | `/tags` | Admin | Create a tag. Body: `name` (1–50), optional `slug` (1–60). |
+
+- When `slug` is omitted it is generated from `name`; generated collisions receive a numeric suffix. If concurrent creates race for the same generated slug, the losing request retries with the next available suffix (up to 10 attempts); both requests normally succeed with distinct slugs.
+- An explicitly supplied duplicate slug → `409`; explicit slugs are never rewritten.
+- Non-admin writes → `403`; unauthenticated writes → `401`.
+- Taxonomy update/delete are not implemented in this iteration.
+
+### 3.9 Audit actions
+
+`EVENT_CREATE`, `EVENT_UPDATE`, `EVENT_CANCEL`, `EVENT_DELETE`, `CATEGORY_CREATE`, and `TAG_CREATE` are written to `audit_logs` in the same transaction as the change.
 
 ---
 
