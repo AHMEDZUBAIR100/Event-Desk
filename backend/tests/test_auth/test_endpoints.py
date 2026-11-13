@@ -7,7 +7,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.token_service import create_refresh_token
-from app.core.security import hash_password, hash_token, verify_password
+from app.core.security import (
+    create_access_token,
+    hash_password,
+    hash_token,
+    verify_password,
+)
 from app.models.user import RefreshToken, User, UserRole
 
 
@@ -467,6 +472,72 @@ async def test_logout_requires_authentication(client: AsyncClient) -> None:
         json={"refresh_token": "anything"},
     )
     assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_logout_with_expired_access_token_revokes_rotated_token(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    attendee_user: User,
+) -> None:
+    """Expired access -> 401, then refresh + logout revokes both refresh tokens.
+
+    This mirrors the frontend logout fallback: the expired access token cannot
+    authenticate logout, so the client rotates the refresh token first and then
+    revokes the rotated token with the freshly issued access token.
+    """
+    email = attendee_user.email
+    raw_password = attendee_user.raw_password  # type: ignore[attr-defined]
+    user_id = attendee_user.id
+    user_role = attendee_user.role.value
+
+    login_data = await _login(client, email, raw_password)
+    original_refresh = str(login_data["refresh_token"])
+    expired_access = create_access_token(
+        user_id,
+        expires_delta=timedelta(seconds=-1),
+        extra_claims={"role": user_role, "type": "access"},
+    )
+
+    expired_logout = await client.post(
+        "/api/v1/auth/logout",
+        headers=_auth_headers(expired_access),
+        json={"refresh_token": original_refresh},
+    )
+    assert expired_logout.status_code == 401
+
+    # The failed logout must not revoke the token; it can still be rotated.
+    rotated = await client.post(
+        "/api/v1/auth/refresh",
+        json={"refresh_token": original_refresh},
+    )
+    assert rotated.status_code == 200
+    rotated_data = rotated.json()
+    rotated_refresh = str(rotated_data["refresh_token"])
+
+    logout = await client.post(
+        "/api/v1/auth/logout",
+        headers=_auth_headers(str(rotated_data["access_token"])),
+        json={"refresh_token": rotated_refresh},
+    )
+    assert logout.status_code == 204
+
+    for token in (original_refresh, rotated_refresh):
+        reuse = await client.post(
+            "/api/v1/auth/refresh",
+            json={"refresh_token": token},
+        )
+        assert reuse.status_code == 401
+
+    revoked_flags = (
+        await db_session.execute(
+            select(RefreshToken.revoked).where(
+                RefreshToken.user_id == user_id
+            )
+        )
+    ).scalars().all()
+    assert revoked_flags
+    assert all(revoked_flags)
 
 
 @pytest.mark.asyncio
