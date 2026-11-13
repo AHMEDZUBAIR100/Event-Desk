@@ -1,0 +1,4 @@
+# Install the backend runtime and development dependencies declared in
+# backend/pyproject.toml. Frontend packages and services are installed with
+# frontend/package-lock.json and docker-compose.yml; see REQUIREMENTS.md.
+-e ./backend[dev]
