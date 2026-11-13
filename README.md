@@ -32,6 +32,8 @@ eventdesk/
 
 ## 🚀 Quick Start (Local Development)
 
+For full install and run instructions, see [REQUIREMENTS.md](REQUIREMENTS.md).
+
 ### 1. Prerequisites
 - Docker & Docker Compose
 - Python 3.12+
@@ -39,7 +41,7 @@ eventdesk/
 
 ### 2. Start Services
 ```bash
-cp .env.example .env
+cp -n .env.example .env
 docker compose up -d
 ```
 Verify running services:
